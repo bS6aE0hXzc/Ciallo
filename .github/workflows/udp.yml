@@ -1,0 +1,113 @@
+name: Windows RDP via Cloudflare Tunnel
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RDP_USER: runneradmin
+  RDP_PASS: P@ssw0rd!2024
+
+jobs:
+  cf-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Enable RDP on Windows Runner
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Set-LocalUser -Name $env:RDP_USER -Password (ConvertTo-SecureString "$env:RDP_PASS" -AsPlainText -Force)
+          Set-Service -Name "W32Time" -StartupType Automatic -ErrorAction SilentlyContinue
+          Restart-Service W32Time -ErrorAction SilentlyContinue
+          w32tm /resync /force | Out-Null
+
+      - name: Download cloudflared
+        run: |
+          Invoke-WebRequest https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.msi -OutFile cloudflared.msi
+          Start-Process msiexec.exe -ArgumentList '/i cloudflared.msi /quiet' -Wait
+          $env:Path += ";C:\Program Files (x86)\cloudflared"
+          cloudflared.exe version
+
+      - name: Start Tunnel, Extract URL & Keep Alive
+        run: |
+          $env:Path += ";C:\Program Files (x86)\cloudflared"
+          
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "cloudflared.exe"
+          $psi.Arguments = "tunnel --url tcp://localhost:3389 --loglevel info"
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.UseShellExecute = $false
+          $psi.CreateNoWindow = $true
+          
+          $p = New-Object System.Diagnostics.Process
+          $p.StartInfo = $psi
+          
+          $syncHash = [hashtable]::Synchronized(@{})
+          $syncHash.Url = $null
+          
+          $stdoutAction = {
+              if ($EventArgs.Data -match '([\w-]+\.trycloudflare\.com)') {
+                  $syncHash.Url = $matches[1].Trim()
+              }
+          }
+          $stderrAction = {
+              if ($EventArgs.Data -match '([\w-]+\.trycloudflare\.com)') {
+                  $syncHash.Url = $matches[1].Trim()
+              }
+          }
+          
+          Register-ObjectEvent -InputObject $p -EventName OutputDataReceived -Action $stdoutAction | Out-Null
+          Register-ObjectEvent -InputObject $p -EventName ErrorDataReceived -Action $stderrAction | Out-Null
+          
+          Write-Host "Starting cloudflared..."
+          $p.Start() | Out-Null
+          $p.BeginOutputReadLine()
+          $p.BeginErrorReadLine()
+          
+          $timeout = 60
+          $timer = 0
+          while (-not $syncHash.Url -and $timer -lt $timeout) {
+              Start-Sleep -Seconds 2
+              $timer += 2
+              if ($p.HasExited) {
+                  Write-Host "cloudflared process exited unexpectedly during startup!"
+                  exit 1
+              }
+          }
+          
+          if (-not $syncHash.Url) {
+              throw "Failed to extract trycloudflare URL."
+          }
+
+          $url = $syncHash.Url
+          Write-Host "============================================"
+          Write-Host "  RDP Connection Details (Cloudflare Tunnel)"
+          Write-Host "============================================"
+          Write-Host "Tunnel Host : $url"
+          Write-Host "Username    : $env:RDP_USER"
+          Write-Host "Password    : $env:RDP_PASS"
+          Write-Host "============================================"
+          Write-Host "客户端连接步骤："
+          Write-Host "1. 本机安装 cloudflared"
+          Write-Host "2. 运行: cloudflared access tcp --hostname $url --url localhost:3390"
+          Write-Host "3. mstsc 连接 localhost:3390，用户名/密码同上"
+          Write-Host "============================================"
+          Write-Host "Tunnel is running. Keeping workflow alive..."
+
+          # 核心修改：在这个 Step 内部无限循环等待，只要进程不退出，Step 就不会结束
+          while (-not $p.HasExited) {
+              Start-Sleep -Seconds 300
+          }
+          
+          Write-Host "cloudflared process has exited. Workflow ending."
+
+      - name: Cleanup
+        if: always()
+        run: Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
