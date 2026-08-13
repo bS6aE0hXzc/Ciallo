@@ -1,0 +1,144 @@
+name: Debian SSH via Cloudflare Tunnel
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SSH_USER: runner
+  SSH_PASS: P@ssw0rd!2024
+
+jobs:
+  cf-ssh:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:latest
+      options: --privileged
+    timeout-minutes: 330
+
+    steps:
+      - name: Enable SSH on Debian Container
+        run: |
+          # Update package list and install SSH server
+          apt-get update
+          apt-get install -y openssh-server sudo curl procps
+          
+          # Create runner user if not exists
+          if ! id -u $SSH_USER > /dev/null 2>&1; then
+              useradd -m -s /bin/bash $SSH_USER
+          fi
+          
+          # Set password for runner user
+          echo "${SSH_USER}:${SSH_PASS}" | chpasswd
+          
+          # Add user to sudoers
+          echo "$SSH_USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+          
+          # Configure SSH to allow password authentication
+          mkdir -p /var/run/sshd
+          sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          
+          # Generate host keys if they don't exist
+          ssh-keygen -A
+          
+          # Start SSH service
+          /usr/sbin/sshd
+          
+          # Verify SSH is running
+          ps aux | grep sshd
+
+      - name: Download cloudflared
+        run: |
+          # Download and install cloudflared
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          mv cloudflared /usr/local/bin/
+          cloudflared --version
+
+      - name: Start Tunnel, Extract URL & Keep Alive
+        run: |
+          # Ensure SSH is running
+          if ! pgrep sshd > /dev/null; then
+              /usr/sbin/sshd
+          fi
+          
+          # Start cloudflared tunnel in background
+          cloudflared tunnel --url ssh://localhost:22 --loglevel info > /tmp/cloudflared.log 2>&1 &
+          CLOUDFLARED_PID=$!
+          
+          # Wait for URL to appear in logs
+          timeout=60
+          timer=0
+          TUNNEL_URL=""
+          
+          while [ -z "$TUNNEL_URL" ] && [ $timer -lt $timeout ]; do
+              sleep 2
+              timer=$((timer + 2))
+              
+              # Check if process is still running
+              if ! kill -0 $CLOUDFLARED_PID 2>/dev/null; then
+                  echo "cloudflared process exited unexpectedly during startup!"
+                  cat /tmp/cloudflared.log
+                  exit 1
+              fi
+              
+              # Extract URL from logs
+              TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' /tmp/cloudflared.log | head -n 1)
+          done
+          
+          if [ -z "$TUNNEL_URL" ]; then
+              echo "Failed to extract trycloudflare URL."
+              cat /tmp/cloudflared.log
+              exit 1
+          fi
+          
+          # Extract hostname without protocol
+          TUNNEL_HOST=$(echo $TUNNEL_URL | sed 's|https://||')
+          
+          echo "============================================"
+          echo "  Debian SSH Connection Details"
+          echo "============================================"
+          echo "Tunnel Host : $TUNNEL_HOST"
+          echo "Username    : $SSH_USER"
+          echo "Password    : $SSH_PASS"
+          echo "============================================"
+          echo "客户端连接步骤："
+          echo "1. 本机安装 cloudflared"
+          echo "2. 运行: cloudflared access ssh --hostname $TUNNEL_HOST"
+          echo "3. 或者使用 SSH 直接连接:"
+          echo "   ssh $SSH_USER@$TUNNEL_HOST"
+          echo ""
+          echo "配置示例 (~/.ssh/config):"
+          echo "Host $TUNNEL_HOST"
+          echo "    ProxyCommand cloudflared access ssh --hostname %h"
+          echo "    User $SSH_USER"
+          echo "============================================"
+          echo ""
+          echo "系统信息："
+          echo "Distribution: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'\"' -f2)"
+          echo "Kernel: $(uname -r)"
+          echo "CPU: $(nproc) cores"
+          echo "Memory: $(free -h | awk '/^Mem:/ {print $2}')"
+          echo "Disk: $(df -h / | awk 'NR==2 {print $2}')"
+          echo "============================================"
+          echo "Tunnel is running. Keeping workflow alive..."
+          
+          # Keep the workflow alive while cloudflared is running
+          while kill -0 $CLOUDFLARED_PID 2>/dev/null; do
+              sleep 300
+          done
+          
+          echo "cloudflared process has exited. Workflow ending."
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Kill any remaining cloudflared processes
+          pkill -f cloudflared || true
+          # Stop SSH service
+          pkill sshd || true
