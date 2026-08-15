@@ -40,19 +40,7 @@ jobs:
 
       - name: Create frpc.toml
         run: |
-          $frpcConfig = @"
-serverAddr = "$env:FRP_SERVER"
-serverPort = 7000
-auth.token = "$env:FRP_TOKEN"
-log.level = "warn"
-
-[[proxies]]
-name = "rdp"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = 3389
-remotePort = $env:FRP_REMOTE_PORT
-"@
+          $frpcConfig = "serverAddr = `"$env:FRP_SERVER`"`nserverPort = 7000`nauth.token = `"$env:FRP_TOKEN`"`nlog.level = `"warn`"`n`n[[proxies]]`nname = `"rdp`"`ntype = `"tcp`"`nlocalIP = `"127.0.0.1`"`nlocalPort = 3389`nremotePort = $env:FRP_REMOTE_PORT"
           Set-Content -Path "$env:FRP_DIR\frpc.toml" -Value $frpcConfig -Encoding UTF8
           Get-Content "$env:FRP_DIR\frpc.toml"
 
