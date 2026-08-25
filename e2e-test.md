@@ -1,3 +1,0 @@
-# e2e-test
-
-created by ghworkflow e2e at 2026-08-26 04:25:56
