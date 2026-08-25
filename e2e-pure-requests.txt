@@ -1,3 +1,0 @@
-# Pure requests web write
-
-Success.
