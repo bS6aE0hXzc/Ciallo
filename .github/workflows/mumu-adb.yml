@@ -86,9 +86,12 @@ jobs:
             $loc = $reg.InstallLocation.Trim('"')
             $cand = Join-Path $loc 'nx_main\MuMuManager.exe'
             if (-not (Test-Path $cand)) { Write-Host "[install] registry ok, nx_main not yet installed"; continue }
-            $busy = (Get-Process | Where-Object { $_.Name -match '^(MuMuSetup|nemu-downloader|aria2|MuMu-setup)' } | Measure-Object).Count
-            Write-Host ("[install] manager=yes installer_procs={0}" -f $busy)
-            if ($busy -eq 0) { $mm = $cand; break }
+            # MuMuSetup (stub shell) may linger forever showing its final screen -
+            # only the downloader/aria2/component installers indicate real work.
+            $stubs  = Get-Process | Where-Object { $_.Name -match '^(nemu-downloader|aria2|MuMu-setup)' }
+            $player = Get-Process | Where-Object { $_.Name -eq 'MuMuNxMain' }
+            Write-Host ("[install] manager=yes stubs={0} player={1}" -f ($stubs | Measure-Object).Count, [bool]$player)
+            if (($stubs | Measure-Object).Count -eq 0 -or $player) { $mm = $cand; break }
           }
           if (-not $mm) {
             Write-Host "::error::installation did not complete; diagnostics:"
@@ -351,6 +354,13 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
+          name: mumu-debug
+          path: |
+            C:\mumu\ui_*.png
+            C:\mumu\ui_status.txt
+            C:\mumu\frpc.log
+          if-no-files-found: ignore
+
           name: mumu-debug
           path: |
             C:\mumu\ui_*.png
