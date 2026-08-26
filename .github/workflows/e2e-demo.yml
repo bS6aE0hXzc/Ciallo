@@ -1,0 +1,14 @@
+name: E2E Demo Workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say hello
+        run: |
+          echo "Hello from a workflow written by ghworkflow!"
+          echo "Run at $(date -u)"
+          echo "::notice::web-reverse-engineered write works for workflows too"
