@@ -71,34 +71,31 @@ jobs:
       - name: Wait for MuMuPlayer installation to complete
         shell: pwsh
         run: |
-          function Get-MuMuInstall {
-            $keys = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue
-            foreach ($k in $keys) {
-              if ($k.DisplayName -match '^MuMuPlayer' -and $k.InstallLocation) { return $k }
-            }
-            return $null
-          }
-          $deadline = (Get-Date).AddMinutes(25)
-          $reg = $null
+          # NOTE: nx_main\MuMuManager.exe appears EARLY (first small component).
+          # Install is only "done" when the manager exists AND the stub/download
+          # processes exited AND the emulator instance (index) is registered.
+          $deadline = (Get-Date).AddMinutes(30)
+          $mm = $null
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 15
-            $reg = Get-MuMuInstall
-            if ($reg) { break }
-            $procs = (Get-Process | Where-Object { $_.Name -match 'aria2|MuMuNx|nemu-down|MuMuSetup' } |
-                      Select-Object -ExpandProperty Name | Sort-Object -Unique) -join ','
-            Write-Host "[install] waiting... procs=[$procs]"
+            $reg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                   Where-Object { $_.DisplayName -match '^MuMuPlayer' -and $_.InstallLocation } |
+                   Select-Object -First 1
+            if (-not $reg) { Write-Host "[install] waiting for registry key..."; continue }
+            $loc = $reg.InstallLocation.Trim('"')
+            $cand = Join-Path $loc 'nx_main\MuMuManager.exe'
+            if (-not (Test-Path $cand)) { Write-Host "[install] registry ok, nx_main not yet installed"; continue }
+            $busy = (Get-Process | Where-Object { $_.Name -match '^(MuMuSetup|nemu-downloader|aria2)$' } | Measure-Object).Count
+            $info = (& $cand info -v all 2>&1 | Out-String)
+            $hasInst = $info -match '"index"'
+            Write-Host ("[install] manager=yes stub_procs={0} instance={1}" -f $busy, $hasInst)
+            if ($busy -eq 0 -and $hasInst) { $mm = $cand; break }
           }
-          if (-not $reg) { throw "MuMuPlayer installation not detected in time" }
+          if (-not $mm) { throw "MuMuPlayer installation did not complete in time" }
           $loc = $reg.InstallLocation.Trim('"')
           Write-Host "============================================"
           Write-Host " MuMuPlayer installed at: $loc"
           Write-Host "============================================"
-          $mm = Join-Path $loc 'nx_main\MuMuManager.exe'
-          if (-not (Test-Path $mm)) {
-            $mm = Get-ChildItem $loc -Recurse -Filter 'MuMuManager.exe' -ErrorAction SilentlyContinue |
-                  Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $mm) { throw "MuMuManager.exe not found under $loc" }
           Write-Host "MuMuManager: $mm"
           "MUMU_MANAGER=$mm"   | Out-File -FilePath $env:GITHUB_ENV -Append
           "MUMU_LOCATION=$loc" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -152,6 +149,14 @@ jobs:
 
           Write-Host "== launching emulator (instance 0)"
           & $mm control -v 0 launch 2>&1 | Write-Host
+          Start-Sleep -Seconds 5
+          $probe = (& $mm info -v 0 2>&1 | Out-String)
+          if ($probe -notmatch '"index"') {
+            Write-Host "== instance 0 missing, creating it"
+            & $mm create -v 0 2>&1 | Write-Host
+            Start-Sleep -Seconds 5
+            & $mm control -v 0 launch 2>&1 | Write-Host
+          }
           Start-Sleep -Seconds 10
           & $mm info -v 0 2>&1 | Write-Host
 
