@@ -67,28 +67,27 @@ jobs:
             return $null
           }
 
-          # Try NSIS-style silent switch first
-          Write-Host "== Attempt 1: MuMuSetup.exe /S"
-          Start-Process $setup -ArgumentList '/S' -WorkingDirectory $env:RUNNER_TEMP
-          $deadline = (Get-Date).AddMinutes(4)
+          # Launch the official downloader once; it fetches the engine and installs itself.
+          # NOTE: do NOT launch it twice - stale nemu-downloader processes deadlock the installer.
+          Write-Host "== Launching MuMuSetup.exe (auto download & install)"
+          Start-Process $setup -WorkingDirectory $env:RUNNER_TEMP
+
+          $deadline = (Get-Date).AddMinutes(50)
+          $tick = 0
           while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 15
-            $r = Find-MuMuRoot
-            if ($r) { break }
-          }
-          $root = Find-MuMuRoot
-          if (-not $root) {
-            Write-Host "== '/S' produced nothing; killing installer and launching downloader UI (auto-downloads & installs)"
-            Get-Process | Where-Object { $_.Path -eq $setup } -ErrorAction SilentlyContinue | Stop-Process -Force
-            Start-Sleep -Seconds 3
-            Start-Process $setup -WorkingDirectory $env:RUNNER_TEMP
-          }
-          # Wait for installation to finish (downloader pulls the full engine package)
-          $deadline = (Get-Date).AddMinutes(45)
-          while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 20
+            Start-Sleep -Seconds 30
+            $tick++
             $root = Find-MuMuRoot
             if ($root) { break }
+            # progress visibility: how much has the downloader cached so far?
+            $sz = 0
+            foreach ($d in @("$env:LOCALAPPDATA\Nemu", "$env:APPDATA\Nemu", "$env:ProgramData\Netease", "$env:TEMP\nemu")) {
+              if (Test-Path $d) {
+                $sz += (Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+              }
+            }
+            $procs = (Get-Process | Where-Object { $_.Name -match 'nemu|MuMu' } | Select-Object -ExpandProperty Name | Sort-Object -Unique) -join ','
+            Write-Host ("[install-wait {0,3}] cached={1}MB procs=[{2}]" -f ($tick * 0.5), [int]($sz / 1MB), $procs)
           }
           if (-not $root) {
             Write-Host "::error::MuMuPlayer installation was not detected within timeout"
