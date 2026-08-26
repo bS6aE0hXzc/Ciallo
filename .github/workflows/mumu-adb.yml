@@ -11,7 +11,6 @@ env:
   FRP_SERVER: 187372.xyz
   FRP_TOKEN: wobushijiahao
   FRP_REMOTE_PORT: 5555
-  MUMU_ADB_PORT: 5555
 
 jobs:
   mumu-adb-frp:
@@ -19,238 +18,208 @@ jobs:
     timeout-minutes: 330
 
     steps:
+      - name: Checkout (for helper scripts)
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------------------
+      # 1) Download MuMuPlayer (international) official online installer
+      # --------------------------------------------------------------------
       - name: Download MuMuPlayer (International)
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          $setup = "$env:RUNNER_TEMP\MuMuSetup.exe"
-          # Official international download API (follows signed redirect to a11.gdl.netease.com)
-          Invoke-WebRequest "https://api.mumuplayer.com/api/dl/win?channel=gw-win-download" -OutFile $setup `
-            -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -MaximumRedirection 10
-          $f = Get-Item $setup
+          New-Item -ItemType Directory -Force C:\mumu | Out-Null
+          # Official international download API (signed redirect to a11.gdl.netease.com)
+          Invoke-WebRequest "https://api.mumuplayer.com/api/dl/win?channel=gw-win-download" `
+            -OutFile C:\mumu\MuMuSetup.exe -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" `
+            -MaximumRedirection 10
+          $f = Get-Item C:\mumu\MuMuSetup.exe
           Write-Host "Downloaded: $($f.FullName) ($([math]::Round($f.Length/1MB,2)) MB)"
-          if ($f.Length -lt 1MB) { throw "Installer looks too small ($($f.Length) bytes)" }
-          "MUMU_SETUP=$setup" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ($f.Length -lt 1MB) { throw "Installer too small ($($f.Length) bytes)" }
 
-      - name: Install MuMuPlayer silently
+      # --------------------------------------------------------------------
+      # 2) Run the installer inside the CONSOLE session (its UI is invisible
+      #    from the agent session) and click "Install now" there.
+      #    Driver: .github/scripts/mumu_ui_click.ps1
+      # --------------------------------------------------------------------
+      - name: Launch installer UI in console session & click Install now
         shell: pwsh
         run: |
-          $ProgressPreference = 'SilentlyContinue'
-          $setup = $env:MUMU_SETUP
+          $driver = Join-Path $env:GITHUB_WORKSPACE '.github\scripts\mumu_ui_click.ps1'
+          $a = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                 -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$driver`"" `
+                 -WorkingDirectory 'C:\mumu'
+          $p = New-ScheduledTaskPrincipal -UserId 'runneradmin' -LogonType Interactive -RunLevel Highest
+          Register-ScheduledTask -TaskName 'MuMuUiClick' -Action $a -Principal $p -Force | Out-Null
+          Start-ScheduledTask -TaskName 'MuMuUiClick'
 
-          function Find-MuMuRoot {
-            # 1) registry uninstall entries
-            $roots = @()
-            foreach ($hive in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-                               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') {
-              Get-ChildItem $hive -ErrorAction SilentlyContinue | ForEach-Object {
-                $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-                if ($p.DisplayName -match 'MuMu' ) {
-                  foreach ($cand in @($p.InstallLocation, $p.DisplayIcon)) {
-                    if ($cand) {
-                      $dir = if (Test-Path $cand -PathType Leaf) { Split-Path $cand } else { $cand }
-                      while ($dir -and -not (Test-Path (Join-Path $dir 'shell'))) { $dir = Split-Path $dir }
-                      if ($dir) { $roots += $dir }
-                    }
-                  }
-                }
-              }
-            }
-            # 2) well-known folders
-            foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
-              Get-ChildItem (Join-Path $base 'Netease') -Directory -ErrorAction SilentlyContinue |
-                Where-Object Name -match 'MuMu|Nemu' | ForEach-Object { $roots += $_.FullName }
-            }
-            foreach ($r in ($roots | Select-Object -Unique)) {
-              if (Test-Path (Join-Path $r 'shell\MuMuManager.exe')) { return $r }
+          # wait for the click (or absence of the dialog)
+          $deadline = (Get-Date).AddMinutes(12)
+          do {
+            Start-Sleep -Seconds 10
+            $s = (Get-Content C:\mumu\ui_status.txt -ErrorAction SilentlyContinue)
+            Write-Host "[ui] $s"
+          } while ($s -notin @('clicked', 'no_window') -and (Get-Date) -lt $deadline)
+          if ($s -eq 'no_window') {
+            Write-Host "::warning::installer dialog not found - maybe it auto-installed; continuing"
+          }
+          if ($s -ne 'clicked' -and $s -ne 'no_window') { throw "installer UI click failed (status=$s)" }
+
+      # --------------------------------------------------------------------
+      # 3) Wait for the (silent, automatic) installation to finish
+      # --------------------------------------------------------------------
+      - name: Wait for MuMuPlayer installation to complete
+        shell: pwsh
+        run: |
+          function Get-MuMuInstall {
+            $keys = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue
+            foreach ($k in $keys) {
+              if ($k.DisplayName -match '^MuMuPlayer' -and $k.InstallLocation) { return $k }
             }
             return $null
           }
-
-          # Launch the official downloader once; it fetches the engine and installs itself.
-          # NOTE: do NOT launch it twice - stale nemu-downloader processes deadlock the installer.
-          Write-Host "== Launching MuMuSetup.exe (auto download & install)"
-          Start-Process $setup -WorkingDirectory $env:RUNNER_TEMP
-
-          $deadline = (Get-Date).AddMinutes(50)
-          $tick = 0
-          while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 30
-            $tick++
-            $root = Find-MuMuRoot
-            if ($root) { break }
-            # progress visibility: how much has the downloader cached so far?
-            $sz = 0
-            foreach ($d in @("$env:LOCALAPPDATA\Nemu", "$env:APPDATA\Nemu", "$env:ProgramData\Netease", "$env:TEMP\nemu")) {
-              if (Test-Path $d) {
-                $sz += (Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
-              }
-            }
-            $procs = (Get-Process | Where-Object { $_.Name -match 'nemu|MuMu' } | Select-Object -ExpandProperty Name | Sort-Object -Unique) -join ','
-            Write-Host ("[install-wait {0,3}] cached={1}MB procs=[{2}]" -f ($tick * 0.5), [int]($sz / 1MB), $procs)
-          }
-          if (-not $root) {
-            Write-Host "::error::MuMuPlayer installation was not detected within timeout"
-            Get-ChildItem "$env:ProgramFiles\Netease" -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object FullName
-            exit 1
-          }
-          Write-Host "============================================"
-          Write-Host " MuMu installed at: $root"
-          Write-Host "============================================"
-          Get-ChildItem $root | Select-Object Name | Format-Table -AutoSize | Out-String | Write-Host
-          "MUMU_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Launch emulator (first boot)
-        shell: pwsh
-        run: |
-          $manager = Join-Path $env:MUMU_ROOT 'shell\MuMuManager.exe'
-          "MUMU_MANAGER=$manager" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-          Write-Host "== Instance overview before launch"
-          & $manager info -v all 2>&1 | Write-Host
-
-          # make sure instance 0 exists (fresh installs usually have it; create if missing)
-          $probe = (& $manager info -v 0 2>&1 | Out-String)
-          if ($probe -notmatch '"index"' -and $probe -notmatch 'is_main') {
-            Write-Host "== Instance 0 missing, creating..."
-            & $manager create -v 0 2>&1 | Write-Host
-          }
-
-          Write-Host "== Launching instance 0"
-          & $manager control -v 0 launch 2>&1 | Write-Host
-
           $deadline = (Get-Date).AddMinutes(25)
-          $started = $false
+          $reg = $null
           while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 10
-            $raw = (& $manager info -v 0 2>&1 | Out-String)
-            if ($raw -match '"launch_err_code"\s*:\s*(-?\d+)' -and $matches[1] -ne '0') {
-              Write-Host "::warning::launch_err_code=$($matches[1])"
-            }
-            if ($raw -match '"is_android_started"\s*:\s*true') { $started = $true; break }
-            if ((Get-Date) -gt $deadline.AddSeconds(-5)) { Write-Host $raw }
+            Start-Sleep -Seconds 15
+            $reg = Get-MuMuInstall
+            if ($reg) { break }
+            $procs = (Get-Process | Where-Object { $_.Name -match 'aria2|MuMuNx|nemu-down|MuMuSetup' } |
+                      Select-Object -ExpandProperty Name | Sort-Object -Unique) -join ','
+            Write-Host "[install] waiting... procs=[$procs]"
           }
-          Write-Host "== Final state after first boot:"
-          & $manager info -v 0 2>&1 | Write-Host
-          if (-not $started) { throw "Android did not finish booting on first launch (check vt_enabled/hyperv above)" }
-          Write-Host "First boot OK"
+          if (-not $reg) { throw "MuMuPlayer installation not detected in time" }
+          $loc = $reg.InstallLocation.Trim('"')
+          Write-Host "============================================"
+          Write-Host " MuMuPlayer installed at: $loc"
+          Write-Host "============================================"
+          $mm = Join-Path $loc 'nx_main\MuMuManager.exe'
+          if (-not (Test-Path $mm)) {
+            $mm = Get-ChildItem $loc -Recurse -Filter 'MuMuManager.exe' -ErrorAction SilentlyContinue |
+                  Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $mm) { throw "MuMuManager.exe not found under $loc" }
+          Write-Host "MuMuManager: $mm"
+          "MUMU_MANAGER=$mm"   | Out-File -FilePath $env:GITHUB_ENV -Append
+          "MUMU_LOCATION=$loc" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $mm info -v all 2>&1 | Write-Host
 
-      - name: Enable root (patch instance configs)
+      # --------------------------------------------------------------------
+      # 4) Enable root (patch instance configs) & (re)launch the emulator
+      # --------------------------------------------------------------------
+      - name: Enable root & launch emulator
         shell: pwsh
         run: |
-          $manager = $env:MUMU_MANAGER
-          $root    = $env:MUMU_ROOT
+          $mm  = $env:MUMU_MANAGER
+          $loc = $env:MUMU_LOCATION
 
-          Write-Host "== Shutting down instance 0 so configs can be patched"
-          & $manager control -v 0 shutdown 2>&1 | Write-Host
-          Start-Sleep -Seconds 20
+          # stop the player so config files can be patched safely
+          Write-Host "== shutting down player (best effort)"
+          & $mm control -v all shutdown 2>&1 | Write-Host
+          Start-Sleep -Seconds 15
 
-          Write-Host "== Available MuMuManager setting keys (for reference/debug):"
-          & $manager setting -v 0 keys 2>&1 | Write-Host
-
-          # locate per-instance config dirs (<root>\vms\*, <root>\nx_device\*\vms\*)
-          $searchBases = @(Join-Path $root 'vms'), (Join-Path $root 'nx_device')
-          $cfgFiles = @()
-          foreach ($b in $searchBases) {
-            if (Test-Path $b) {
-              $cfgFiles += Get-ChildItem $b -Recurse -Depth 6 -Include customer_config.json -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-            }
-          }
-          if (-not $cfgFiles) { $cfgFiles = Get-ChildItem $root -Recurse -Depth 8 -Include customer_config.json -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName }
-          if (-not $cfgFiles) { throw "No customer_config.json found under $root" }
-
-          function Add-Node($obj, [string]$name) {
-            if (-not ($obj.PSObject.Properties[$name])) {
-              $obj | Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{})
-            }
-            return $obj.$name
-          }
-
-          foreach ($cf in $cfgFiles) {
-            Write-Host "== Patching $cf"
-            $j = Get-Content $cf -Raw -Encoding UTF8 | ConvertFrom-Json
-            $setting = Add-Node $j 'setting'
-            $other   = Add-Node $setting 'other_setting'
-            # Root permission ON
-            if ($other.PSObject.Properties['root_mode']) { $other.root_mode = '1' }
-            else { $other | Add-Member -NotePropertyName root_mode -NotePropertyValue '1' }
-            # Writable system disk
-            $disk = Add-Node $setting 'disk_share'
-            $mode = Add-Node $disk 'mode'
-            if ($mode.PSObject.Properties['choose']) { $mode.choose = 'disk_share.mode.writable' }
-            else { $mode | Add-Member -NotePropertyName choose -NotePropertyValue 'disk_share.mode.writable' }
-            $j | ConvertTo-Json -Depth 64 | Set-Content $cf -Encoding UTF8
-
-            $vf = Join-Path (Split-Path $cf) 'vm_config.json'
-            if (Test-Path $vf) {
-              $v = Get-Content $vf -Raw -Encoding UTF8 | ConvertFrom-Json
-              if     ($v.system_vdi -and $v.system_vdi.PSObject.Properties['sharable'])   { $v.system_vdi.sharable = 'Writable' }
-              elseif ($v.vm -and $v.vm.system_vdi -and $v.vm.system_vdi.PSObject.Properties['sharable']) { $v.vm.system_vdi.sharable = 'Writable' }
-              else {
-                $svd = Add-Node $v 'system_vdi'
-                $svd | Add-Member -NotePropertyName sharable -NotePropertyValue 'Writable'
+          Write-Host "== patching root permission in instance configs"
+          $cfgs = @(Get-ChildItem "$loc\vms" -Recurse -Depth 3 -Filter 'customer_config.json' -ErrorAction SilentlyContinue) +
+                  (Get-ChildItem "$loc\nx_device" -Recurse -Depth 5 -Filter 'customer_config.json' -ErrorAction SilentlyContinue)
+          $cfgs = $cfgs | Select-Object -Unique -ExpandProperty FullName
+          if (-not $cfgs) { Write-Host "::warning::no customer_config.json found - root stays at default (adbd is root anyway)" }
+          foreach ($cf in $cfgs) {
+            try {
+              Write-Host "== patching $cf"
+              $j = Get-Content $cf -Raw -Encoding UTF8 | ConvertFrom-Json
+              if (-not $j.setting) { $j | Add-Member -NotePropertyName setting -NotePropertyValue ([pscustomobject]@{}) }
+              if (-not $j.setting.other_setting) { $j.setting | Add-Member -NotePropertyName other_setting -NotePropertyValue ([pscustomobject]@{}) }
+              if ($j.setting.other_setting.PSObject.Properties['root_mode']) { $j.setting.other_setting.root_mode = '1' }
+              else { $j.setting.other_setting | Add-Member -NotePropertyName root_mode -NotePropertyValue '1' }
+              if (-not $j.setting.disk_share) { $j.setting | Add-Member -NotePropertyName disk_share -NotePropertyValue ([pscustomobject]@{}) }
+              if (-not $j.setting.disk_share.mode) { $j.setting.disk_share | Add-Member -NotePropertyName mode -NotePropertyValue ([pscustomobject]@{}) }
+              if ($j.setting.disk_share.mode.PSObject.Properties['choose']) { $j.setting.disk_share.mode.choose = 'disk_share.mode.writable' }
+              else { $j.setting.disk_share.mode | Add-Member -NotePropertyName choose -NotePropertyValue 'disk_share.mode.writable' }
+              $j | ConvertTo-Json -Depth 64 | Set-Content $cf -Encoding UTF8
+              $vf = Join-Path (Split-Path $cf) 'vm_config.json'
+              if (Test-Path $vf) {
+                $v = Get-Content $vf -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($v.system_vdi -and $v.system_vdi.PSObject.Properties['sharable']) { $v.system_vdi.sharable = 'Writable' }
+                elseif ($v.vm -and $v.vm.system_vdi -and $v.vm.system_vdi.PSObject.Properties['sharable']) { $v.vm.system_vdi.sharable = 'Writable' }
+                else {
+                  if (-not $v.system_vdi) { $v | Add-Member -NotePropertyName system_vdi -NotePropertyValue ([pscustomobject]@{}) }
+                  $v.system_vdi | Add-Member -NotePropertyName sharable -NotePropertyValue 'Writable'
+                }
+                $v | ConvertTo-Json -Depth 64 | Set-Content $vf -Encoding UTF8
               }
-              $v | ConvertTo-Json -Depth 64 | Set-Content $vf -Encoding UTF8
-              Write-Host "== Patched $vf"
-            }
+            } catch { Write-Host "::warning::patch failed for ${cf}: $_" }
           }
 
-          Write-Host "== Relaunching instance 0 with root enabled"
-          & $manager control -v 0 launch 2>&1 | Write-Host
-          $deadline = (Get-Date).AddMinutes(25); $started = $false
-          while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 10
-            $raw = (& $manager info -v 0 2>&1 | Out-String)
-            if ($raw -match '"is_android_started"\s*:\s*true') { $started = $true; break }
-          }
-          if (-not $started) { throw "Android did not come back after enabling root" }
-          $raw = (& $manager info -v 0 2>&1 | Out-String)
-          Write-Host $raw
-          if ($raw -match '"adb_host_ip"\s*:\s*"([^"]+)"') { $ip = $matches[1] } else { $ip = '127.0.0.1' }
-          if ($raw -match '"adb_port"\s*:\s*(\d+)')        { $port = [int]$matches[1] } else { $port = 5555 }
-          Write-Host "ADB endpoint reported by MuMuManager: ${ip}:${port}"
-          "MUMU_ADB_IP=$ip"  | Out-File -FilePath $env:GITHUB_ENV -Append
-          "MUMU_ADB_PORT_DETECTED=$port" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "== launching emulator (instance 0)"
+          & $mm control -v 0 launch 2>&1 | Write-Host
+          Start-Sleep -Seconds 10
+          & $mm info -v 0 2>&1 | Write-Host
 
-      - name: Setup adb and expose it on port 5555
+      # --------------------------------------------------------------------
+      # 5) Install platform-tools and wait until adb on 127.0.0.1:5555 is up
+      #    (MuMu international exposes adbd on 5555; it answers mid-boot)
+      # --------------------------------------------------------------------
+      - name: Wait for ADB on 127.0.0.1:5555
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest https://dl.google.com/android/repository/platform-tools-latest-windows.zip -OutFile plt.zip
-          Expand-Archive plt.zip -DestinationPath plt
-          $plt = "$PWD\plt\platform-tools"
-          $env:Path = "$plt;$env:Path"
-          "PLT_DIR=$plt" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Invoke-WebRequest https://dl.google.com/android/repository/platform-tools-latest-windows.zip -OutFile C:\mumu\plt.zip
+          Expand-Archive C:\mumu\plt.zip -DestinationPath C:\mumu\plt
+          $env:Path = "C:\mumu\plt\platform-tools;$env:Path"
+          "PLT_DIR=C:\mumu\plt\platform-tools" | Out-File -FilePath $env:GITHUB_ENV -Append
           adb version
 
-          $srcPort = [int]$env:MUMU_ADB_PORT_DETECTED
-          adb kill-server; adb start-server
-          adb connect "127.0.0.1:$srcPort"
-          adb devices
-
-          # Make sure ADB is reachable on 127.0.0.1:5555 (what frpc forwards)
-          if ($srcPort -ne 5555) {
-            Write-Host "== MuMu bridge is on $srcPort; adding portproxy 5555 -> $srcPort"
-            New-NetFirewallRule -DisplayName 'Allow MuMu ADB 5555' -Direction Inbound -LocalPort 5555 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
-            netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=5555 connectaddress=127.0.0.1 connectport=$srcPort
-            netsh interface portproxy show all
-          } else {
-            Write-Host "== MuMu bridge already listens on 5555, no proxy needed"
+          $deadline = (Get-Date).AddMinutes(50)
+          $ok = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 15
+            $lis = (netstat -ano | Select-String '127\.0\.0\.1:5555\s.*LISTENING' | Measure-Object).Count
+            if ($lis -eq 0) { Write-Host "[adb] 5555 not listening yet"; continue }
+            adb start-server 2>$null
+            adb connect 127.0.0.1:5555 | Write-Host
+            $d = adb devices | Out-String
+            Write-Host $d
+            if ($d -match '127\.0\.0\.1:5555\s+device' -or $d -match 'emulator-5554\s+device') { $ok = $true; break }
           }
-          Test-NetConnection 127.0.0.1 -Port 5555 | Format-List TcpTestSucceeded
+          if (-not $ok) { throw "adb device on 5555 did not come up in time" }
+          Write-Host "ADB is up on 127.0.0.1:5555"
 
-      - name: Start frpc (5555 -> 187372.xyz:5555)
+      # --------------------------------------------------------------------
+      # 6) Make sure adbd runs as root (warm-up; final check comes last)
+      # --------------------------------------------------------------------
+      - name: Enable root over adb (adb root)
+        shell: pwsh
+        run: |
+          $env:Path = "$env:PLT_DIR;$env:Path"
+          foreach ($i in 1..5) {
+            adb connect 127.0.0.1:5555 2>$null | Out-Null
+            $r = adb -s 127.0.0.1:5555 root 2>&1 | Out-String
+            Write-Host "adb root => $($r.Trim())"
+            if ($r -match 'root') { break }
+            Start-Sleep -Seconds 10
+          }
+          Start-Sleep -Seconds 5
+          adb connect 127.0.0.1:5555 | Write-Host
+          $id = adb -s 127.0.0.1:5555 shell id 2>&1 | Out-String
+          Write-Host "id (via -s) => $($id.Trim())"
+          adb -s 127.0.0.1:5555 shell getprop ro.build.version.release
+          adb -s 127.0.0.1:5555 shell getprop ro.product.model
+
+      # --------------------------------------------------------------------
+      # 7) Start frpc: 127.0.0.1:5555 -> 187372.xyz:5555
+      # --------------------------------------------------------------------
+      - name: Start frpc (port5555)
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest https://github.com/fatedier/frp/releases/download/v0.61.1/frp_0.61.1_windows_amd64.zip -OutFile frp.zip
-          Expand-Archive frp.zip -DestinationPath .
-          $frpDir = (Get-ChildItem -Directory -Filter "frp_0.61.1_windows_amd64" | Select-Object -First 1).FullName
-          "FRP_DIR=$frpDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Set-Location C:\mumu
+          Invoke-WebRequest https://github.com/fatedier/frp/releases/download/v0.61.1/frp_0.61.1_windows_amd64.zip -OutFile C:\mumu\frp.zip
+          Expand-Archive C:\mumu\frp.zip -DestinationPath C:\mumu\frpdir
+          Copy-Item (Get-ChildItem C:\mumu\frpdir -Recurse -Filter frpc.exe | Select-Object -First 1 -ExpandProperty FullName) C:\mumu\frpc.exe -Force
+          Get-Item C:\mumu\frpc.exe | Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Write-Host
 
-          Set-Location $frpDir
-          $log = "$frpDir\frpc.log"
-          $args = @(
+          Write-Host "Launching: .\frpc.exe tcp --server_addr=$env:FRP_SERVER --server_port=7000 --token=*** --proxy_name=port5555 --local_ip=127.0.0.1 --local_port=5555 --remote_port=$env:FRP_REMOTE_PORT"
+          $p = Start-Process C:\mumu\frpc.exe -ArgumentList @(
             'tcp',
             "--server_addr=$env:FRP_SERVER",
             '--server_port=7000',
@@ -259,63 +228,82 @@ jobs:
             '--local_ip=127.0.0.1',
             '--local_port=5555',
             "--remote_port=$env:FRP_REMOTE_PORT"
-          )
-          Write-Host "Launching: .\frpc.exe $($args -join ' ')"
-          $p = Start-Process -FilePath '.\frpc.exe' -ArgumentList $args -PassThru -WindowStyle Hidden -RedirectStandardOutput $log -RedirectStandardError "$frpDir\frpc.err.log"
-          Start-Sleep -Seconds 8
-          Get-Content $log -ErrorAction SilentlyContinue | Write-Host
-          Get-Content "$frpDir\frpc.err.log" -ErrorAction SilentlyContinue | Write-Host
-          if ($p.HasExited) { throw "frpc exited immediately with code $($p.ExitCode)" }
+          ) -PassThru -WindowStyle Hidden -RedirectStandardOutput C:\mumu\frpc.log -RedirectStandardError C:\mumu\frpc.err.log
+          Start-Sleep -Seconds 10
+          Get-Content C:\mumu\frpc.log     | Write-Host
+          Get-Content C:\mumu\frpc.err.log | Write-Host
+          if ($p.HasExited) { throw "frpc exited immediately (code $($p.ExitCode))" }
+          if (-not (Get-Content C:\mumu\frpc.log | Select-String 'start proxy success')) {
+            throw "frpc did not report 'start proxy success'"
+          }
           "FRPC_PID=$($p.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
-
           Write-Host "============================================"
-          Write-Host "  ADB over frp is up"
-          Write-Host "============================================"
-          Write-Host "Server : $env:FRP_SERVER:$env:FRP_REMOTE_PORT"
-          Write-Host "Connect: adb connect $env:FRP_SERVER`:$env:FRP_REMOTE_PORT"
+          Write-Host "  frp tunnel up: adb connect $env:FRP_SERVER`:$env:FRP_REMOTE_PORT"
           Write-Host "============================================"
 
-      - name: Verify root & adb (adb root && adb shell id)
+      # --------------------------------------------------------------------
+      # 8) REQUIRED FINAL VERIFICATION: adb root && adb shell id
+      # --------------------------------------------------------------------
+      - name: FINAL VERIFICATION (adb root && adb shell id)
         shell: pwsh
         run: |
           $env:Path = "$env:PLT_DIR;$env:Path"
-          adb kill-server; adb start-server
-          adb connect 127.0.0.1:5555
-          adb devices
+          adb kill-server 2>$null
+          adb start-server 2>$null
+          adb connect 127.0.0.1:5555 | Write-Host
+          Start-Sleep -Seconds 2
+          # dedupe transports: MuMu's adbd also auto-registers as emulator-5554
+          adb disconnect 127.0.0.1:5555 | Write-Host
+          Start-Sleep -Seconds 2
+          $dev = adb devices | Out-String
+          Write-Host $dev
+          if ($dev -match 'emulator-5554\s+device') { $env:ANDROID_SERIAL = 'emulator-5554' }
+          else {
+            Write-Host "emulator transport absent, falling back to tcp serial"
+            adb connect 127.0.0.1:5555 | Write-Host
+            $env:ANDROID_SERIAL = '127.0.0.1:5555'
+          }
 
-          # drop any duplicate transport so plain `adb` targets the 5555 device
-          $det = [int]$env:MUMU_ADB_PORT_DETECTED
-          if ($det -ne 5555) { adb disconnect "127.0.0.1:$det" }
+          $final = ''
+          foreach ($i in 1..3) {
+            Write-Host "============================================================"
+            Write-Host "  REQUIRED FINAL VERIFICATION: adb root && adb shell id"
+            Write-Host "============================================================"
+            $final = (adb root && adb shell id) 2>&1 | Out-String
+            Write-Host $final.Trim()
+            if ($final -match 'uid=0\(root\)') { break }
+            Write-Host "attempt $i failed, reconnecting and retrying..."
+            adb kill-server 2>$null; adb start-server 2>$null
+            adb connect 127.0.0.1:5555 | Out-Null
+            Start-Sleep -Seconds 5
+          }
+          if ($final -notmatch 'uid=0\(root\)') { throw "FINAL VERIFICATION FAILED - no uid=0(root)" }
+          Write-Host "============================================================"
+          Write-Host "  VERIFIED: root (uid=0) + adb available on 5555"
+          Write-Host "  external: adb connect $env:FRP_SERVER`:$env:FRP_REMOTE_PORT"
+          Write-Host "============================================================"
 
-          Write-Host "== REQUIRED FINAL VERIFICATION: adb root && adb shell id"
-          adb root
-          Start-Sleep -Seconds 3
-          adb connect 127.0.0.1:5555 | Out-Null
-          $id = adb shell id
-          Write-Host "adb shell id => $id"
-          if ($id -notmatch 'uid=0\(root\)') { throw "Root verification FAILED: '$id'" }
-          Write-Host "============================================"
-          Write-Host "  VERIFIED: uid=0(root) via adb on 127.0.0.1:5555"
-          Write-Host "============================================"
-          adb shell getprop ro.build.version.release
-          adb shell getprop ro.product.model
-
+      # --------------------------------------------------------------------
+      # 9) Keep alive (frp tunnel + emulator stay up for the job window)
+      # --------------------------------------------------------------------
       - name: Keep alive
         shell: pwsh
         run: |
           $env:Path = "$env:PLT_DIR;$env:Path"
-          Write-Host "Serving adb over frp at $env:FRP_SERVER`:$env:FRP_REMOTE_PORT (job timeout 330m)"
+          $cli = @('tcp', "--server_addr=$env:FRP_SERVER", '--server_port=7000', "--token=$env:FRP_TOKEN",
+                   '--proxy_name=port5555', '--local_ip=127.0.0.1', '--local_port=5555',
+                   "--remote_port=$env:FRP_REMOTE_PORT")
           while ($true) {
             Start-Sleep -Seconds 300
-            $t = (Test-NetConnection 127.0.0.1 -Port 5555 -WarningAction SilentlyContinue).TcpTestSucceeded
-            $d = (adb devices | Out-String).Trim() -replace "`r", ''
-            Write-Host "[heartbeat] local5555=$t; $d"
-            if (-not $t) {
-              Write-Host "::warning::nothing listening on 5555, re-establishing"
-              adb connect "127.0.0.1:$env:MUMU_ADB_PORT_DETECTED"
-              $det = [int]$env:MUMU_ADB_PORT_DETECTED
-              if ($det -ne 5555) { netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=5555 connectaddress=127.0.0.1 connectport=$det }
+            $frpc = (Get-Process frpc -ErrorAction SilentlyContinue | Measure-Object).Count
+            if ($frpc -eq 0) {
+              Write-Host "[heartbeat] frpc died - restarting"
+              Start-Process C:\mumu\frpc.exe -ArgumentList $cli -WindowStyle Hidden `
+                -RedirectStandardOutput C:\mumu\frpc.log -RedirectStandardError C:\mumu\frpc.err.log
             }
+            adb connect 127.0.0.1:5555 2>$null | Out-Null
+            $d = (adb devices | Out-String).Trim() -replace "`r", ''
+            Write-Host "[heartbeat] frpc_procs=$frpc; $d"
           }
 
       - name: Cleanup
@@ -324,3 +312,15 @@ jobs:
         run: |
           Get-Process frpc -ErrorAction SilentlyContinue | Stop-Process -Force
           if ($env:MUMU_MANAGER) { & $env:MUMU_MANAGER control -v all shutdown 2>&1 }
+
+      - name: Upload debug artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: mumu-debug
+          path: |
+            C:\mumu\ui_*.png
+            C:\mumu\ui_status.txt
+            C:\mumu\frpc.log
+          if-no-files-found: ignore
