@@ -72,10 +72,11 @@ jobs:
         shell: pwsh
         run: |
           # NOTE: nx_main\MuMuManager.exe appears EARLY (first small component).
-          # Install is only "done" when the manager exists AND the stub/download
-          # processes exited AND the emulator instance (index) is registered.
-          $deadline = (Get-Date).AddMinutes(30)
-          $mm = $null
+          # Install is "done" when the manager exists AND every installer process
+          # (stub, downloader, aria2, component installers) has exited.
+          # Instance creation (if any) is handled by the next step.
+          $deadline = (Get-Date).AddMinutes(35)
+          $mm = $null; $loc = $null
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 15
             $reg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
@@ -85,14 +86,22 @@ jobs:
             $loc = $reg.InstallLocation.Trim('"')
             $cand = Join-Path $loc 'nx_main\MuMuManager.exe'
             if (-not (Test-Path $cand)) { Write-Host "[install] registry ok, nx_main not yet installed"; continue }
-            $busy = (Get-Process | Where-Object { $_.Name -match '^(MuMuSetup|nemu-downloader|aria2)$' } | Measure-Object).Count
-            $info = (& $cand info -v all 2>&1 | Out-String)
-            $hasInst = $info -match '"index"'
-            Write-Host ("[install] manager=yes stub_procs={0} instance={1}" -f $busy, $hasInst)
-            if ($busy -eq 0 -and $hasInst) { $mm = $cand; break }
+            $busy = (Get-Process | Where-Object { $_.Name -match '^(MuMuSetup|nemu-downloader|aria2|MuMu-setup)' } | Measure-Object).Count
+            Write-Host ("[install] manager=yes installer_procs={0}" -f $busy)
+            if ($busy -eq 0) { $mm = $cand; break }
           }
-          if (-not $mm) { throw "MuMuPlayer installation did not complete in time" }
-          $loc = $reg.InstallLocation.Trim('"')
+          if (-not $mm) {
+            Write-Host "::error::installation did not complete; diagnostics:"
+            if ($mm -eq $null -and $loc) {
+              Get-ChildItem $loc -Directory -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+                Select-Object -First 40 -ExpandProperty FullName | Write-Host
+              & (Join-Path $loc 'nx_main\MuMuManager.exe') info -v all 2>&1 | Write-Host
+            }
+            Get-ChildItem "$env:LOCALAPPDATA\Temp" -Filter 'nemux-downloader-*.log' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime | Select-Object -Last 1 |
+              ForEach-Object { Get-Content $_.FullName -Tail 30 | Write-Host }
+            throw "MuMuPlayer installation did not complete in time"
+          }
           Write-Host "============================================"
           Write-Host " MuMuPlayer installed at: $loc"
           Write-Host "============================================"
@@ -109,6 +118,16 @@ jobs:
         run: |
           $mm  = $env:MUMU_MANAGER
           $loc = $env:MUMU_LOCATION
+
+          # engine sanity check: the Android ROM component must be installed
+          $engine = Get-ChildItem $loc -Directory -Filter 'nx_device' -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if (-not $engine) {
+            Write-Host "::error::engine component (nx_device) missing - ROM install failed"
+            Get-ChildItem $loc -Directory | Select-Object -ExpandProperty FullName | Write-Host
+            throw "engine component missing"
+          }
+          Write-Host "== engine found: $($engine.FullName)"
 
           # stop the player so config files can be patched safely
           Write-Host "== shutting down player (best effort)"
@@ -157,8 +176,17 @@ jobs:
             Start-Sleep -Seconds 5
             & $mm control -v 0 launch 2>&1 | Write-Host
           }
-          Start-Sleep -Seconds 10
+          # wait until the instance is registered and its process started
+          $deadline = (Get-Date).AddMinutes(6)
+          $started = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $probe = (& $mm info -v 0 2>&1 | Out-String)
+            Write-Host ("[launch] process_started={0}" -f ($probe -match '"is_process_started"\s*:\s*true'))
+            if ($probe -match '"is_process_started"\s*:\s*true') { $started = $true; break }
+          }
           & $mm info -v 0 2>&1 | Write-Host
+          if (-not $started) { throw "emulator instance 0 did not start (see info above)" }
 
       # --------------------------------------------------------------------
       # 5) Install platform-tools and wait until adb on 127.0.0.1:5555 is up
