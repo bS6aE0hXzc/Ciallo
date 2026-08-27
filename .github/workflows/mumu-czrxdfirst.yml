@@ -9,8 +9,9 @@ jobs:
   mumu-czrxdfirst:
     uses: ./.github/workflows/mumu-adb.yml
     with:
-      # Direct APK (应用宝 CDN). Version-pinned; if it 404s the base
-      # workflow falls back to scraping the latest link from sj.qq.com.
-      preinstall_apk_url: 'https://imtt2.dd.qq.com/sjy.00008/sjy.00004/16891/apk/7542B962129EB1691ED44214B1BB4996.apk?fsname=com.pi.czrxdfirst_1.32.21.001.apk'
+      # Official game APK (chaoziran.com / 超自然行动组, package com.pi.czrxdfirst).
+      # If this ever 404s, the base workflow falls back to scraping the latest
+      # link for the package from sj.qq.com.
+      preinstall_apk_url: 'https://op-file.preternatural.cc/pntlpro/apk/czrxd_901_official_1.32.14.001_acesafe.apk'
       preinstall_package: 'com.pi.czrxdfirst'
       preinstall_name: '超自然行动组'
