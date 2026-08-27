@@ -231,44 +231,6 @@ jobs:
           Write-Host "ADB is up on 127.0.0.1:5555"
 
       # --------------------------------------------------------------------
-      # 4) Start frpc tunnel: 127.0.0.1:5555 -> 187372.xyz:5555
-      # --------------------------------------------------------------------
-      - name: Start frpc (port5555)
-        shell: pwsh
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          Set-Location C:\mumu
-          if (-not (Test-Path C:\mumu\frpc.exe)) {
-            Invoke-WebRequest https://github.com/fatedier/frp/releases/download/v0.61.1/frp_0.61.1_windows_amd64.zip -OutFile C:\mumu\frp.zip
-            Expand-Archive C:\mumu\frp.zip -DestinationPath C:\mumu\frpdir -Force
-            Copy-Item (Get-ChildItem C:\mumu\frpdir -Recurse -Filter frpc.exe | Select-Object -First 1 -ExpandProperty FullName) C:\mumu\frpc.exe -Force
-          }
-          Write-Host "Launching: .\frpc.exe tcp --server_addr=$env:FRP_SERVER --server_port=7000 --token=*** --proxy_name=port5555 --local_ip=127.0.0.1 --local_port=5555 --remote_port=$env:FRP_REMOTE_PORT"
-          $p = Start-Process C:\mumu\frpc.exe -ArgumentList @(
-            'tcp',
-            "--server_addr=$env:FRP_SERVER",
-            '--server_port=7000',
-            "--token=$env:FRP_TOKEN",
-            '--proxy_name=port5555',
-            '--local_ip=127.0.0.1',
-            '--local_port=5555',
-            "--remote_port=$env:FRP_REMOTE_PORT"
-          ) -PassThru -WindowStyle Hidden -RedirectStandardOutput C:\mumu\frpc.log -RedirectStandardError C:\mumu\frpc.err.log
-          Start-Sleep -Seconds 10
-          Get-Content C:\mumu\frpc.log     | Write-Host
-          Get-Content C:\mumu\frpc.err.log | Write-Host
-          if ($p.HasExited) {
-            Write-Host "::warning::frpc exited immediately (code $($p.ExitCode))"
-          } else {
-            $flog = Get-Content C:\mumu\frpc.log -ErrorAction SilentlyContinue
-            if ($flog | Select-String 'start proxy success') { Write-Host "frpc proxy 'port5555' started successfully" }
-          }
-          "FRPC_PID=$($p.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "============================================"
-          Write-Host "  frp tunnel up: adb connect $env:FRP_SERVER`:$env:FRP_REMOTE_PORT"
-          Write-Host "============================================"
-
-      # --------------------------------------------------------------------
       # 5) REQUIRED FINAL VERIFICATION: adb root && adb shell id
       # --------------------------------------------------------------------
       - name: FINAL VERIFICATION (adb root && adb shell id)
@@ -366,6 +328,43 @@ jobs:
             Write-Host "============================================"
           }
 
+      # --------------------------------------------------------------------
+      # 4) Start frpc tunnel: 127.0.0.1:5555 -> 187372.xyz:5555
+      # --------------------------------------------------------------------
+      - name: Start frpc (port5555)
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Set-Location C:\mumu
+          if (-not (Test-Path C:\mumu\frpc.exe)) {
+            Invoke-WebRequest https://github.com/fatedier/frp/releases/download/v0.61.1/frp_0.61.1_windows_amd64.zip -OutFile C:\mumu\frp.zip
+            Expand-Archive C:\mumu\frp.zip -DestinationPath C:\mumu\frpdir -Force
+            Copy-Item (Get-ChildItem C:\mumu\frpdir -Recurse -Filter frpc.exe | Select-Object -First 1 -ExpandProperty FullName) C:\mumu\frpc.exe -Force
+          }
+          Write-Host "Launching: .\frpc.exe tcp --server_addr=$env:FRP_SERVER --server_port=7000 --token=*** --proxy_name=port5555 --local_ip=127.0.0.1 --local_port=5555 --remote_port=$env:FRP_REMOTE_PORT"
+          $p = Start-Process C:\mumu\frpc.exe -ArgumentList @(
+            'tcp',
+            "--server_addr=$env:FRP_SERVER",
+            '--server_port=7000',
+            "--token=$env:FRP_TOKEN",
+            '--proxy_name=port5555',
+            '--local_ip=127.0.0.1',
+            '--local_port=5555',
+            "--remote_port=$env:FRP_REMOTE_PORT"
+          ) -PassThru -WindowStyle Hidden -RedirectStandardOutput C:\mumu\frpc.log -RedirectStandardError C:\mumu\frpc.err.log
+          Start-Sleep -Seconds 10
+          Get-Content C:\mumu\frpc.log     | Write-Host
+          Get-Content C:\mumu\frpc.err.log | Write-Host
+          if ($p.HasExited) {
+            Write-Host "::warning::frpc exited immediately (code $($p.ExitCode))"
+          } else {
+            $flog = Get-Content C:\mumu\frpc.log -ErrorAction SilentlyContinue
+            if ($flog | Select-String 'start proxy success') { Write-Host "frpc proxy 'port5555' started successfully" }
+          }
+          "FRPC_PID=$($p.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "============================================"
+          Write-Host "  frp tunnel up: adb connect $env:FRP_SERVER`:$env:FRP_REMOTE_PORT"
+          Write-Host "============================================"
       # --------------------------------------------------------------------
       # 6) Keep alive (frp tunnel + emulator stay up for the job window)
       # --------------------------------------------------------------------
