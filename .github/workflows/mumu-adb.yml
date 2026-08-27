@@ -168,7 +168,9 @@ jobs:
           $candidates = @('7555','7556','5555','5556','7557','7655','7656','7558','7657')
           $real = $null
           $deadline = (Get-Date).AddMinutes(10)
+          $attempt = 0
           while ((Get-Date) -lt $deadline) {
+            $attempt++
             Start-Sleep -Seconds 10
             adb start-server 2>$null | Out-Null
             foreach ($p in $candidates) {
@@ -188,7 +190,10 @@ jobs:
               if ($emu) { $real = 'emulator-5554' }
             }
             if ($real) { break }
-            Write-Host "[adb] no device yet, retrying..."
+            # avoid log spam: only report every 5th attempt (~every 2.5 min)
+            if ($attempt % 5 -eq 0) {
+              Write-Host "[adb] no device yet (attempt $attempt, elapsed $((Get-Date).Subtract($deadline.AddMinutes(-10)).TotalMinutes.ToString('0'))m)..."
+            }
           }
           if (-not $real) { throw "adb device did not come up in time" }
           Write-Host "ADB device found at: $real"
@@ -318,9 +323,7 @@ jobs:
               Start-Process C:\mumu\frpc.exe -ArgumentList $cli -WindowStyle Hidden `
                 -RedirectStandardOutput C:\mumu\frpc.log -RedirectStandardError C:\mumu\frpc.err.log
             }
-            adb connect 127.0.0.1:5555 2>$null | Out-Null
-            $d = (adb devices | Out-String).Trim() -replace "`r", ''
-            Write-Host "[heartbeat] frpc_procs=$frpc; $d"
+            Write-Host "[heartbeat] frpc_procs=$frpc"
           }
 
       - name: Cleanup
