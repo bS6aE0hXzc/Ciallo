@@ -297,8 +297,6 @@ jobs:
               Start-Process C:\mumu\frpc.exe -ArgumentList $cli -WindowStyle Hidden `
                 -RedirectStandardOutput C:\mumu\frpc.log -RedirectStandardError C:\mumu\frpc.err.log
             }
-            adb connect 127.0.0.1:5555 2>$null | Out-Null
-            $d = (adb devices | Out-String).Trim() -replace "`r", ''
             Write-Host "[heartbeat] frpc_procs=$frpc; $d"
           }
 
