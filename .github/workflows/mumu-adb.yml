@@ -327,6 +327,11 @@ jobs:
             Write-Host "  GAME/APP INSTALLED: $name ($pkg)"
             Write-Host "============================================"
           }
+                    
+          # Kill ADB server after successful installation
+          Write-Host "killing ADB server..."
+          & $adb kill-server 2>&1 | Write-Host
+          Write-Host "ADB server killed successfully"
 
       # --------------------------------------------------------------------
       # 4) Start frpc tunnel: 127.0.0.1:5555 -> 187372.xyz:5555
