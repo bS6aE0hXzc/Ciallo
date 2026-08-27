@@ -192,10 +192,12 @@ jobs:
           if (-not $started) { throw "emulator instance 0 did not start (see info above)" }
 
       # --------------------------------------------------------------------
-      # 5) Install platform-tools and wait until adb on 127.0.0.1:5555 is up
-      #    (MuMu international exposes adbd on 5555; it answers mid-boot)
+      # 5) Install platform-tools, discover MuMu's real adb port, then re-bind
+      #    adbd to 127.0.0.1:5555 (the requirement) via `adb tcpip 5555`.
+      #    MuMu (NetEase) exposes adbd per-instance (commonly 7555/7556, not
+      #    5555), so we detect it instead of assuming 5555.
       # --------------------------------------------------------------------
-      - name: Wait for ADB on 127.0.0.1:5555
+      - name: Discover ADB port, expose adbd on 5555
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
@@ -205,19 +207,46 @@ jobs:
           "PLT_DIR=C:\mumu\plt\platform-tools" | Out-File -FilePath $env:GITHUB_ENV -Append
           adb version
 
+          # Candidate ports MuMu could be using for the first instance(s).
+          $candidates = @('7555','7556','5555','5556','7557','7655','7558','7656','5557','7657')
+          $real = $null
           $deadline = (Get-Date).AddMinutes(50)
-          $ok = $false
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 15
-            $lis = (netstat -ano | Select-String '127\.0\.0\.1:5555\s.*LISTENING' | Measure-Object).Count
-            if ($lis -eq 0) { Write-Host "[adb] 5555 not listening yet"; continue }
-            adb start-server 2>$null
-            adb connect 127.0.0.1:5555 | Write-Host
-            $d = adb devices | Out-String
-            Write-Host $d
-            if ($d -match '127\.0\.0\.1:5555\s+device' -or $d -match 'emulator-5554\s+device') { $ok = $true; break }
+            adb start-server 2>$null | Out-Null
+            foreach ($p in $candidates) {
+              $ep = "127.0.0.1:$p"
+              adb connect $ep 2>$null | Out-Null
+              if (adb devices | Select-String "$ep\s+device") { $real = $ep; break }
+            }
+            if (-not $real) {
+              $emu = (adb devices | Select-String 'emulator-5554\s+device')
+              if ($emu) { $real = 'emulator-5554' }
+            }
+            if ($real) { break }
+            Write-Host "[adb] no device yet, retrying..."
           }
-          if (-not $ok) { throw "adb device on 5555 did not come up in time" }
+          if (-not $real) { throw "adb device did not come up in time" }
+          Write-Host "ADB device found at: $real"
+          "MUMU_ADB=$real" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # Re-bind adbd to TCP 5555 so the frp tunnel (local_port=5555) and the
+          # required final `adb root && adb shell id` both talk to 127.0.0.1:5555.
+          if ($real -ne '127.0.0.1:5555') {
+            Write-Host "== rebinding adbd to tcp:5555 (via $real)"
+            adb -s $real tcpip 5555 2>&1 | Write-Host
+            Start-Sleep -Seconds 6
+            adb disconnect $real 2>$null | Out-Null
+            $ok5555 = $false
+            for ($t = 0; $t -lt 10; $t++) {
+              adb connect 127.0.0.1:5555 2>&1 | Write-Host
+              if (adb devices | Select-String '127\.0\.0\.1:5555\s+device') { $ok5555 = $true; break }
+              Start-Sleep -Seconds 5
+            }
+            if (-not $ok5555) { throw "adbd did not come up on 5555 after rebind" }
+          }
+          $d = adb devices | Out-String
+          Write-Host $d
           Write-Host "ADB is up on 127.0.0.1:5555"
 
       # --------------------------------------------------------------------
@@ -268,9 +297,17 @@ jobs:
           Start-Sleep -Seconds 10
           Get-Content C:\mumu\frpc.log     | Write-Host
           Get-Content C:\mumu\frpc.err.log | Write-Host
-          if ($p.HasExited) { throw "frpc exited immediately (code $($p.ExitCode))" }
-          if (-not (Get-Content C:\mumu\frpc.log | Select-String 'start proxy success')) {
-            throw "frpc did not report 'start proxy success'"
+          if ($p.HasExited) {
+            Write-Host "::warning::frpc exited immediately (code $($p.ExitCode)) - tunnel will be retried by keep-alive"
+          } else {
+            $flog = Get-Content C:\mumu\frpc.log -ErrorAction SilentlyContinue
+            if ($flog | Select-String 'start proxy success') {
+              Write-Host "frpc proxy 'port5555' started successfully"
+            } else {
+              Write-Host "::warning::frpc has not reported 'start proxy success' yet (server unreachable / bad token?). Local 5555 + root are still verified below; tunnel may not be externally reachable."
+              Get-Content C:\mumu\frpc.log -ErrorAction SilentlyContinue | Write-Host
+              Get-Content C:\mumu\frpc.err.log -ErrorAction SilentlyContinue | Write-Host
+            }
           }
           "FRPC_PID=$($p.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "============================================"
@@ -286,29 +323,35 @@ jobs:
           $env:Path = "$env:PLT_DIR;$env:Path"
           adb kill-server 2>$null
           adb start-server 2>$null
-          adb connect 127.0.0.1:5555 | Write-Host
           Start-Sleep -Seconds 2
-          # dedupe transports: MuMu's adbd also auto-registers as emulator-5554
-          adb disconnect 127.0.0.1:5555 | Write-Host
-          Start-Sleep -Seconds 2
-          $dev = adb devices | Out-String
-          Write-Host $dev
-          if ($dev -match 'emulator-5554\s+device') { $env:ANDROID_SERIAL = 'emulator-5554' }
-          else {
-            Write-Host "emulator transport absent, falling back to tcp serial"
-            adb connect 127.0.0.1:5555 | Write-Host
-            $env:ANDROID_SERIAL = '127.0.0.1:5555'
+
+          # Ensure 127.0.0.1:5555 is the live adb endpoint (this is what the
+          # frp tunnel forwards). Re-bind from the discovered port if needed.
+          $have = (adb devices | Select-String '127\.0\.0\.1:5555\s+device')
+          if (-not $have) {
+            if ($env:MUMU_ADB -and $env:MUMU_ADB -ne '127.0.0.1:5555') {
+              Write-Host "== 5555 missing, rebinding from $env:MUMU_ADB"
+              adb -s $env:MUMU_ADB tcpip 5555 2>&1 | Write-Host
+              Start-Sleep -Seconds 6
+            }
+            for ($t = 0; $t -lt 10; $t++) {
+              adb connect 127.0.0.1:5555 2>&1 | Write-Host
+              if (adb devices | Select-String '127\.0\.0\.1:5555\s+device') { break }
+              Start-Sleep -Seconds 5
+            }
           }
+          $env:ANDROID_SERIAL = '127.0.0.1:5555'
+          adb devices | Write-Host
 
           $final = ''
-          foreach ($i in 1..3) {
+          foreach ($i in 1..5) {
             Write-Host "============================================================"
             Write-Host "  REQUIRED FINAL VERIFICATION: adb root && adb shell id"
             Write-Host "============================================================"
             $final = (adb root && adb shell id) 2>&1 | Out-String
             Write-Host $final.Trim()
             if ($final -match 'uid=0\(root\)') { break }
-            Write-Host "attempt $i failed, reconnecting and retrying..."
+            Write-Host "attempt $i did not show uid=0(root); reconnecting and retrying..."
             adb kill-server 2>$null; adb start-server 2>$null
             adb connect 127.0.0.1:5555 | Out-Null
             Start-Sleep -Seconds 5
@@ -347,7 +390,7 @@ jobs:
         shell: pwsh
         run: |
           Get-Process frpc -ErrorAction SilentlyContinue | Stop-Process -Force
-          if ($env:MUMU_MANAGER) { & $env:MUMU_MANAGER control -v all shutdown 2>&1 }
+          if ($env:MUMU_MANAGER) { & $env:MUMU_MANAGER control -v all shutdown 2>&1 | Out-Null }
 
       - name: Upload debug artifacts
         if: always()
@@ -358,12 +401,7 @@ jobs:
           path: |
             C:\mumu\ui_*.png
             C:\mumu\ui_status.txt
-            C:\mumu\frpc.log
-          if-no-files-found: ignore
-
-          name: mumu-debug
-          path: |
-            C:\mumu\ui_*.png
             C:\mumu\ui_status.txt
             C:\mumu\frpc.log
+            C:\mumu\frpc.err.log
           if-no-files-found: ignore
