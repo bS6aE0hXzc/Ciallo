@@ -2,6 +2,23 @@ name: Windows MuMu Player ADB via frp
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      preinstall_apk_url:
+        description: 'Direct APK download URL to pre-install into the emulator (optional)'
+        required: false
+        default: ''
+        type: string
+      preinstall_package:
+        description: 'Expected package name, used to verify the install (optional)'
+        required: false
+        default: ''
+        type: string
+      preinstall_name:
+        description: 'Human-readable game/app name for log output (optional)'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -296,6 +313,58 @@ jobs:
           Write-Host "  VERIFIED: root (uid=0) + adb available on 5555"
           Write-Host "  external: adb connect $env:FRP_SERVER`:$env:FRP_REMOTE_PORT"
           Write-Host "============================================================"
+
+      # --------------------------------------------------------------------
+      # 5b) Optional pre-installed game/app APK (passed in when this workflow
+      #     is reused via `uses:`). Skipped for a plain manual dispatch.
+      # --------------------------------------------------------------------
+      - name: Pre-install game/app APK (optional)
+        if: ${{ inputs.preinstall_apk_url != '' }}
+        shell: pwsh
+        run: |
+          $adb = $env:ADB
+          $env:Path = ((Split-Path $adb) + ';' + $env:Path)
+          $url  = '${{ inputs.preinstall_apk_url }}'
+          $pkg  = '${{ inputs.preinstall_package }}'
+          $name = '${{ inputs.preinstall_name }}'
+          $apk  = 'C:\mumu\preinstall.apk'
+          Write-Host "Pre-installing: $name ($pkg)"
+
+          $ok = $false
+          # 1) try the explicit URL
+          try {
+            Write-Host "downloading APK from provided URL..."
+            Invoke-WebRequest $url -OutFile $apk -TimeoutSec 900 `
+              -UserAgent 'Mozilla/5.0' -Headers @{ Referer = 'https://sj.qq.com/' }
+            $ok = $true
+          } catch { Write-Host "::warning::explicit URL failed: $_" }
+          # 2) fallback: scrape the latest APK link from 应用宝 by package name
+          if (-not $ok -and $pkg) {
+            try {
+              Write-Host "fallback: scraping latest APK for $pkg from sj.qq.com ..."
+              $pg  = (Invoke-WebRequest "https://sj.qq.com/appdetail/$pkg" -UserAgent 'Mozilla/5.0').Content
+              $m   = [regex]::Match($pg, 'https?://[^\s\"\x27>]+\.apk\?fsname=' + [regex]::Escape($pkg) + '_[^\s\"\x27>]+')
+              if ($m.Success) {
+                Invoke-WebRequest $m.Value -OutFile $apk -TimeoutSec 900 `
+                  -UserAgent 'Mozilla/5.0' -Headers @{ Referer = 'https://sj.qq.com/' }
+                $ok = $true
+              }
+            } catch { Write-Host "::warning::scrape fallback failed: $_" }
+          }
+          if (-not $ok) { throw "could not download game/app APK for $name" }
+
+          Write-Host "APK size: $((Get-Item $apk).Length) bytes"
+          Write-Host "installing via adb ..."
+          & $adb -s 127.0.0.1:5555 install -r $apk 2>&1 | Write-Host
+          $inst = (& $adb -s 127.0.0.1:5555 shell pm list packages 2>$null | Out-String)
+          if ($pkg -and ($inst -notmatch [regex]::Escape($pkg))) {
+            Write-Host "::warning::package $pkg NOT found after install; pm list packages:"
+            Write-Host $inst
+          } else {
+            Write-Host "============================================"
+            Write-Host "  GAME/APP INSTALLED: $name ($pkg)"
+            Write-Host "============================================"
+          }
 
       # --------------------------------------------------------------------
       # 6) Keep alive (frp tunnel + emulator stay up for the job window)
