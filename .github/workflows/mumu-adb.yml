@@ -335,8 +335,9 @@ jobs:
 
       # --------------------------------------------------------------------
       # 4) Start frpc tunnel: 127.0.0.1:5555 -> 187372.xyz:5555
+      #    (includes keep-alive heartbeat loop)
       # --------------------------------------------------------------------
-      - name: Start frpc (port5555)
+      - name: Start frpc (port5555) + Keep alive
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
@@ -347,7 +348,7 @@ jobs:
             Copy-Item (Get-ChildItem C:\mumu\frpdir -Recurse -Filter frpc.exe | Select-Object -First 1 -ExpandProperty FullName) C:\mumu\frpc.exe -Force
           }
           Write-Host "Launching: .\frpc.exe tcp --server_addr=$env:FRP_SERVER --server_port=7000 --token=*** --proxy_name=port5555 --local_ip=127.0.0.1 --local_port=5555 --remote_port=$env:FRP_REMOTE_PORT"
-          $p = Start-Process C:\mumu\frpc.exe -ArgumentList @(
+          $cli = @(
             'tcp',
             "--server_addr=$env:FRP_SERVER",
             '--server_port=7000',
@@ -356,7 +357,8 @@ jobs:
             '--local_ip=127.0.0.1',
             '--local_port=5555',
             "--remote_port=$env:FRP_REMOTE_PORT"
-          ) -PassThru -WindowStyle Hidden -RedirectStandardOutput C:\mumu\frpc.log -RedirectStandardError C:\mumu\frpc.err.log
+          )
+          $p = Start-Process C:\mumu\frpc.exe -ArgumentList $cli -PassThru -WindowStyle Hidden -RedirectStandardOutput C:\mumu\frpc.log -RedirectStandardError C:\mumu\frpc.err.log
           Start-Sleep -Seconds 10
           Get-Content C:\mumu\frpc.log     | Write-Host
           Get-Content C:\mumu\frpc.err.log | Write-Host
@@ -370,24 +372,10 @@ jobs:
           Write-Host "============================================"
           Write-Host "  frp tunnel up: adb connect $env:FRP_SERVER`:$env:FRP_REMOTE_PORT"
           Write-Host "============================================"
-      # --------------------------------------------------------------------
-      # 6) Keep alive (frp tunnel + emulator stay up for the job window)
-      # --------------------------------------------------------------------
-      - name: Keep alive
-        shell: pwsh
-        run: |
-          $adb = $env:ADB
-          $env:Path = ((Split-Path $adb) + ';' + $env:Path)
-          $cli = @(
-            'tcp',
-            "--server_addr=$env:FRP_SERVER",
-            '--server_port=7000',
-            "--token=$env:FRP_TOKEN",
-            '--proxy_name=port5555',
-            '--local_ip=127.0.0.1',
-            '--local_port=5555',
-            "--remote_port=$env:FRP_REMOTE_PORT"
-          )
+
+          # --------------------------------------------------------------------
+          # Keep alive loop (restart frpc if it dies)
+          # --------------------------------------------------------------------
           while ($true) {
             Start-Sleep -Seconds 300
             $frpc = (Get-Process frpc -ErrorAction SilentlyContinue | Measure-Object).Count
